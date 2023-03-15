@@ -1196,23 +1196,24 @@ struct ping_host_struct *fast_ping_start(PING_TYPE type, const char *host, int c
 
 	addrkey = _fast_ping_hash_key(ping_host->sid, &ping_host->addr);
 
-	_fast_ping_host_get(ping_host);
-	_fast_ping_host_get(ping_host);
-	// for ping race condition, get reference count twice
-	if (_fast_ping_sendping(ping_host) != 0) {
-		goto errout_remove;
-	}
-
+	_fast_ping_host_get(ping_host); // caller reference
 	pthread_mutex_lock(&ping.map_lock);
-	_fast_ping_host_get(ping_host);
+	_fast_ping_host_get(ping_host); // hashmap reference
 	if (hash_empty(ping.addrmap)) {
 		_fast_ping_wakeup_thread();
 	}
 	hash_add(ping.addrmap, &ping_host->addr_node, addrkey);
 	ping_host->run = 1;
 	pthread_mutex_unlock(&ping.map_lock);
+	
+	_fast_ping_host_get(ping_host); // get ping reference
+	// for ping race condition, get reference count twice
+	if (_fast_ping_sendping(ping_host) != 0) {
+		goto errout_remove;
+	}
+
 	freeaddrinfo(gai);
-	_fast_ping_host_put(ping_host);
+	_fast_ping_host_put(ping_host); // put ping reference
 	return ping_host;
 errout_remove:
 	ping_host->ping_callback(ping_host, ping_host->host, PING_RESULT_ERROR, &ping_host->addr, ping_host->addr_len,
@@ -1800,8 +1801,9 @@ static void *_fast_ping_work(void *arg)
 			sleep_time = -1;
 		}
 		pthread_mutex_unlock(&ping.map_lock);
-
+		errno = 0;
 		num = epoll_wait(ping.epoll_fd, events, PING_MAX_EVENTS, sleep_time);
+		
 		if (num < 0) {
 			usleep(100000);
 			continue;
@@ -1894,6 +1896,7 @@ int fast_ping_init(void)
 	ping.ident = (getpid() & 0XFFFF);
 	atomic_set(&ping.run, 1);
 
+	ping.epoll_fd = epollfd;
 	ret = pthread_create(&ping.tid, &attr, _fast_ping_work, NULL);
 	if (ret != 0) {
 		tlog(TLOG_ERROR, "create ping work thread failed, %s\n", strerror(ret));
@@ -1906,7 +1909,6 @@ int fast_ping_init(void)
 		goto errout;
 	}
 
-	ping.epoll_fd = epollfd;
 	ret = _fast_ping_init_wakeup_event();
 	if (ret != 0) {
 		tlog(TLOG_ERROR, "init wakeup event failed, %s\n", strerror(errno));
@@ -1934,6 +1936,8 @@ errout:
 	if (epollfd > 0) {
 		close(epollfd);
 	}
+
+	ping.epoll_fd = -1;
 
 	if (ping.event_fd) {
 		close(ping.event_fd);
